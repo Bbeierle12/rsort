@@ -59,10 +59,13 @@ impl Args {
                 } else if s.len() == 1 {
                     Ok(Some(s.as_bytes()[0]))
                 } else if s.starts_with('\\') && s.len() == 2 {
-                    // Handle other escapes like \t
+                    // Handle common escape sequences
                     match s.chars().nth(1) {
                         Some('t') => Ok(Some(b'\t')),
                         Some('n') => Ok(Some(b'\n')),
+                        Some('r') => Ok(Some(b'\r')),
+                        Some('v') => Ok(Some(b'\x0B')), // vertical tab
+                        Some('f') => Ok(Some(b'\x0C')), // form feed
                         Some('\\') => Ok(Some(b'\\')),
                         Some('0') => Ok(Some(0u8)),
                         _ => Err(crate::error::RsortError::InvalidDelimiter),
