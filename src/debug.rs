@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use crate::config::Config;
-use crate::key::extract_key;
+use crate::key::{extract_key, split_fields_with_positions};
 
 /// Debug output for a single line showing key spans
 ///
@@ -29,10 +29,10 @@ pub fn debug_line<W: Write>(
             if key.is_empty() {
                 writeln!(writer, "^ no match for key")?;
             } else {
-                // Find where the key appears in the line
-                if let Some(pos) = find_key_position(line, &key, key_spec, config) {
-                    let indent = " ".repeat(pos);
-                    let underline = "_".repeat(key.len().max(1));
+                // Find the full span of the key in the original line
+                if let Some((start, end)) = find_key_span(line, key_spec, config) {
+                    let indent = " ".repeat(start);
+                    let underline = "_".repeat((end - start).max(1));
                     writeln!(writer, "{}{}", indent, underline)?;
                 } else {
                     // Key extracted but position unclear
@@ -46,72 +46,38 @@ pub fn debug_line<W: Write>(
     Ok(())
 }
 
-/// Find the column position of a key within the line
-fn find_key_position(
+/// Find the byte span (start, end) of a key within the line
+fn find_key_span(
     line: &[u8],
-    _key: &[u8],
     key_spec: &crate::key::KeySpec,
     config: &Config,
-) -> Option<usize> {
-    // Calculate position based on field/char spec
+) -> Option<(usize, usize)> {
     let fields = split_fields_with_positions(line, config.field_separator);
 
-    let field_idx = key_spec.start_field.saturating_sub(1);
-    if field_idx >= fields.len() {
+    let start_idx = key_spec.start_field.saturating_sub(1);
+    if start_idx >= fields.len() {
         return None;
     }
 
-    let (field_start, _field_end) = fields[field_idx];
-    let char_offset = key_spec.start_char.unwrap_or(1).saturating_sub(1);
+    let end_idx = key_spec
+        .end_field
+        .map(|f| f.saturating_sub(1).min(fields.len().saturating_sub(1)))
+        .unwrap_or(fields.len().saturating_sub(1));
 
-    Some(field_start + char_offset)
-}
+    let (first_start, first_end) = fields[start_idx];
+    let (last_start, last_end) = fields[end_idx];
 
-/// Split line into fields, returning (start_pos, end_pos) for each
-fn split_fields_with_positions(line: &[u8], separator: Option<u8>) -> Vec<(usize, usize)> {
-    match separator {
-        Some(sep) => {
-            let mut fields = Vec::new();
-            let mut start = 0;
+    // Apply character offsets
+    let start_char_offset = key_spec.start_char.unwrap_or(1).saturating_sub(1);
+    let byte_start = (first_start + start_char_offset).min(first_end);
 
-            for (i, &b) in line.iter().enumerate() {
-                if b == sep {
-                    fields.push((start, i));
-                    start = i + 1;
-                }
-            }
-            fields.push((start, line.len()));
-            fields
-        }
-        None => {
-            // Whitespace-delimited
-            let mut fields = Vec::new();
-            let mut in_field = false;
-            let mut start = 0;
+    let byte_end = if let Some(ec) = key_spec.end_char {
+        (last_start + ec).min(last_end)
+    } else {
+        last_end
+    };
 
-            for (i, &b) in line.iter().enumerate() {
-                let is_space = b == b' ' || b == b'\t';
-
-                if is_space && in_field {
-                    fields.push((start, i));
-                    in_field = false;
-                } else if !is_space && !in_field {
-                    start = i;
-                    in_field = true;
-                }
-            }
-
-            if in_field {
-                fields.push((start, line.len()));
-            }
-
-            if fields.is_empty() {
-                fields.push((0, 0));
-            }
-
-            fields
-        }
-    }
+    Some((byte_start, byte_end))
 }
 
 /// Emit debug output for all input lines during the read phase
@@ -149,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_debug_whole_line() {
-        let mut config = test_config();
+        let config = test_config();
         let mut output = Vec::new();
         debug_line(&mut output, b"hello", &config).unwrap();
         let output_str = String::from_utf8(output).unwrap();

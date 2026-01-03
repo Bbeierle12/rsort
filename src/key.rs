@@ -40,6 +40,49 @@ impl KeySpec {
             (None, None)
         };
 
+        // Validate end_field
+        if let Some(ef) = end_field {
+            if ef == 0 {
+                return Err(RsortError::InvalidKey(
+                    "end field must be >= 1".to_string(),
+                ));
+            }
+            if ef < start_field {
+                return Err(RsortError::InvalidKey(format!(
+                    "end field {} < start field {}",
+                    ef, start_field
+                )));
+            }
+        }
+
+        // Validate character positions
+        if let Some(sc) = start_char {
+            if sc == 0 {
+                return Err(RsortError::InvalidKey(
+                    "start char must be >= 1".to_string(),
+                ));
+            }
+        }
+        if let Some(ec) = end_char {
+            if ec == 0 {
+                return Err(RsortError::InvalidKey(
+                    "end char must be >= 1".to_string(),
+                ));
+            }
+        }
+
+        // Same field: validate char ordering
+        if end_field == Some(start_field) {
+            if let (Some(sc), Some(ec)) = (start_char, end_char) {
+                if ec < sc {
+                    return Err(RsortError::InvalidKey(format!(
+                        "end char {} < start char {}",
+                        ec, sc
+                    )));
+                }
+            }
+        }
+
         Ok(KeySpec {
             start_field,
             start_char,
@@ -78,74 +121,64 @@ fn parse_field_char(s: &str) -> Result<(usize, Option<usize>)> {
 }
 
 /// Extract key bytes from a record based on KeySpec
+/// For multi-field keys, preserves original bytes (including separators) from the record
 pub fn extract_key(record: &[u8], spec: &KeySpec, field_separator: Option<u8>) -> Vec<u8> {
-    let fields = split_fields(record, field_separator);
+    let fields_with_pos = split_fields_with_positions(record, field_separator);
 
     // Convert to 0-indexed
     let start_idx = spec.start_field.saturating_sub(1);
 
     // Field doesn't exist: return empty
-    if start_idx >= fields.len() {
+    if start_idx >= fields_with_pos.len() {
         return Vec::new();
     }
 
     let end_idx = spec
         .end_field
-        .map(|f| f.saturating_sub(1).min(fields.len().saturating_sub(1)))
-        .unwrap_or(fields.len().saturating_sub(1));
+        .map(|f| f.saturating_sub(1).min(fields_with_pos.len().saturating_sub(1)))
+        .unwrap_or(fields_with_pos.len().saturating_sub(1));
 
-    // Single field extraction with character positions
+    let (first_start, first_end) = fields_with_pos[start_idx];
+    let (last_start, last_end) = fields_with_pos[end_idx];
+
+    // Apply character offsets
+    let start_char_offset = spec.start_char.unwrap_or(1).saturating_sub(1);
+    let byte_start = (first_start + start_char_offset).min(first_end);
+
+    let byte_end = if let Some(ec) = spec.end_char {
+        // end_char applies to the last field
+        (last_start + ec).min(last_end)
+    } else {
+        last_end
+    };
+
+    // For single field, just slice
     if start_idx == end_idx {
-        let field = fields[start_idx];
-        let start_char = spec.start_char.unwrap_or(1).saturating_sub(1);
-        let end_char = spec.end_char.unwrap_or(field.len());
-
-        return field
-            .get(start_char..end_char.min(field.len()))
-            .unwrap_or(&[])
-            .to_vec();
+        return record.get(byte_start..byte_end).unwrap_or(&[]).to_vec();
     }
 
-    // Multiple fields: concatenate with separator
-    let mut result = Vec::new();
-    for i in start_idx..=end_idx {
-        if i < fields.len() {
-            if !result.is_empty() {
-                // Use space as separator for whitespace-delimited, else use actual separator
-                let sep = field_separator.unwrap_or(b' ');
-                result.push(sep);
-            }
-
-            let field = fields[i];
-
-            // Apply char positions only to first/last fields
-            let start = if i == start_idx {
-                spec.start_char.unwrap_or(1).saturating_sub(1)
-            } else {
-                0
-            };
-            let end = if i == end_idx {
-                spec.end_char.unwrap_or(field.len()).min(field.len())
-            } else {
-                field.len()
-            };
-
-            if let Some(slice) = field.get(start..end) {
-                result.extend_from_slice(slice);
-            }
-        }
-    }
-
-    result
+    // For multiple fields, copy the entire span from record (preserving original separators)
+    record.get(byte_start..byte_end).unwrap_or(&[]).to_vec()
 }
 
-/// Split record into fields based on separator
-fn split_fields(record: &[u8], separator: Option<u8>) -> Vec<&[u8]> {
+/// Split record into fields, returning (start_pos, end_pos) for each
+pub fn split_fields_with_positions(record: &[u8], separator: Option<u8>) -> Vec<(usize, usize)> {
     match separator {
-        Some(sep) => record.split(|&b| b == sep).collect(),
+        Some(sep) => {
+            let mut fields = Vec::new();
+            let mut start = 0;
+
+            for (i, &b) in record.iter().enumerate() {
+                if b == sep {
+                    fields.push((start, i));
+                    start = i + 1;
+                }
+            }
+            fields.push((start, record.len()));
+            fields
+        }
         None => {
-            // Default: split on runs of whitespace (space or tab)
-            // Leading whitespace is included in first field
+            // Whitespace-delimited
             let mut fields = Vec::new();
             let mut in_field = false;
             let mut start = 0;
@@ -154,7 +187,7 @@ fn split_fields(record: &[u8], separator: Option<u8>) -> Vec<&[u8]> {
                 let is_space = b == b' ' || b == b'\t';
 
                 if is_space && in_field {
-                    fields.push(&record[start..i]);
+                    fields.push((start, i));
                     in_field = false;
                 } else if !is_space && !in_field {
                     start = i;
@@ -163,18 +196,18 @@ fn split_fields(record: &[u8], separator: Option<u8>) -> Vec<&[u8]> {
             }
 
             if in_field {
-                fields.push(&record[start..]);
+                fields.push((start, record.len()));
             }
 
-            // Handle empty record
             if fields.is_empty() {
-                fields.push(&record[0..0]);
+                fields.push((0, 0));
             }
 
             fields
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {

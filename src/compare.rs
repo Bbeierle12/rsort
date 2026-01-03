@@ -81,38 +81,36 @@ pub fn compare_numeric(a: &[u8], b: &[u8]) -> Ordering {
 
 /// Parse leading number from bytes (GNU sort -n compatible)
 ///
-/// - Skips leading whitespace
+/// - Skips leading whitespace (space and tab only)
 /// - Handles optional sign (+ or -)
 /// - Handles decimal point
 /// - Stops at first non-numeric character
 /// - Returns 0.0 for non-numeric input
+/// - Works directly on bytes without requiring valid UTF-8
 fn parse_leading_number(s: &[u8]) -> f64 {
-    // Convert to string for parsing (safe - we only care about ASCII digits)
-    let s = match std::str::from_utf8(s) {
-        Ok(s) => s,
-        Err(_) => return 0.0,
-    };
-
-    let s = s.trim_start();
-    if s.is_empty() {
+    // Skip leading whitespace (bytes)
+    let mut idx = 0;
+    while idx < s.len() && (s[idx] == b' ' || s[idx] == b'\t') {
+        idx += 1;
+    }
+    if idx >= s.len() {
         return 0.0;
     }
 
-    // Find the numeric prefix
+    let s = &s[idx..];
     let mut end = 0;
     let mut has_dot = false;
-    let chars: Vec<char> = s.chars().collect();
 
     // Optional sign
-    if end < chars.len() && (chars[end] == '-' || chars[end] == '+') {
+    if end < s.len() && (s[end] == b'-' || s[end] == b'+') {
         end += 1;
     }
 
-    // Digits and optional decimal point
-    while end < chars.len() {
-        if chars[end].is_ascii_digit() {
+    // Digits and decimal point
+    while end < s.len() {
+        if s[end].is_ascii_digit() {
             end += 1;
-        } else if chars[end] == '.' && !has_dot {
+        } else if s[end] == b'.' && !has_dot {
             has_dot = true;
             end += 1;
         } else {
@@ -120,12 +118,14 @@ fn parse_leading_number(s: &[u8]) -> f64 {
         }
     }
 
-    // Handle edge case: just a sign or just a dot
-    if end == 0 || (end == 1 && (chars[0] == '-' || chars[0] == '+' || chars[0] == '.')) {
+    // Edge cases: just sign or just dot
+    if end == 0 || (end == 1 && matches!(s[0], b'-' | b'+' | b'.')) {
         return 0.0;
     }
 
-    let num_str: String = chars[..end].iter().collect();
+    // Convert only the numeric prefix to string (guaranteed ASCII, so always valid UTF-8)
+    // SAFETY: We've verified all bytes are ASCII digits, sign, or dot
+    let num_str = unsafe { std::str::from_utf8_unchecked(&s[..end]) };
     num_str.parse().unwrap_or(0.0)
 }
 
@@ -223,6 +223,16 @@ mod tests {
     fn test_numeric_empty() {
         assert_eq!(compare_numeric(b"", b"0"), Ordering::Equal);
         assert_eq!(compare_numeric(b"   ", b"0"), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_numeric_with_high_bytes() {
+        // Lines with invalid UTF-8 should still parse numeric prefix
+        // "5\xff" should parse as 5, not 0
+        assert_eq!(compare_numeric(b"5\xff", b"3"), Ordering::Greater);
+        assert_eq!(compare_numeric(b"5\xff", b"5"), Ordering::Equal);
+        // "\xff5" has no numeric prefix, so it's 0
+        assert_eq!(compare_numeric(b"\xff5", b"0"), Ordering::Equal);
     }
 
     #[test]
